@@ -1,0 +1,330 @@
+---
+title: "Spatial Regression in R"
+author: "Kerry Cella"
+date: "21 May 2017"
+output: 
+  html_document:
+    css: custom.css
+    toc: yes
+    toc_depth: 4
+---
+
+### Introduction
+
+Today's session will provide a brief introduction to Spatial regression. This is a type of regression that takes spatial components into account. For instance the affect that a high crime ward might have on it's neighbours.
+
+Tobler's first law of geography states: **"everything is related to everything else, but near things are more related than distant things."** We can use spatial regression techniques to both test for and prove this.
+
+We're going to use data I downloaded from the [Police.uk](https://www.police.uk) website. It's all offences that were recorded by the Metropolitan Police Service between between September 2016 and March 2017. I have also included a spatial mapping layer of hexagons created originally by Road Space Management (RSM) with pedestrian trips attached. We will also be using the locations of bus stops too.
+
+I would always recommend clearing your R memory before beginning anything new. You can clear out all obects by executing the function rm(list=ls()). We will also load the libraries we need for today. 
+```{r, warning=FALSE , message=FALSE}
+rm(list=ls())
+
+library(dplyr); library (spdep); library (rgdal); library(sp); library(ggplot2); library(classInt)
+library(maptools); library(RColorBrewer); library(mapproj)
+```
+
+And set you're work directory as normal to where you might want to read data in from or store outputs. I've stored all of my data in the same directory.
+
+```{r, echo=FALSE}
+setwd("U:\\Data\\R Test\\Spatial Regression tutorial")
+```
+
+```{r, eval=FALSE}
+setwd("U:\\Data\\MyDirectory")
+```
+
+<br>
+
+### Read in and explore the data
+
+You'll notice that the police.uk website provided a separate csv for each month. We can bind these all together in R really easily using the following code. We first create a list of the object we want and then use rbind() in the do.call() wrapper to bind them all together.
+
+```{r, warning=FALSE, message=FALSE}
+#create a file list
+files_crime <- list.files(".", pattern="*street.csv", full.names=FALSE)
+
+
+#read files in and combine them into one data frame
+crime_092016_032017 <- do.call("rbind",
+                        lapply(files_crime , function(files_crime){
+                          read.csv(files_crime, header=T)
+                        }
+                        )
+)
+
+```
+
+Let's check our data out. We will use str() to see the structure of data that and we will also use the powerful summary() function to see how each of the columns stack up.
+
+```{r}
+
+str(crime_092016_032017)
+
+summary(crime_092016_032017)
+
+```
+<br>
+
+### Violent offences
+
+For the purposes of today we are only going to focus on violent offences. We'll use the dplyr package to filter the data. We could use R's inbuilt indexing but dplyr has a nice syntax.
+
+```{r}
+
+violent_offences<- crime_092016_032017 %>% filter(Crime.type == "Violence and sexual offences")
+
+```
+
+You may remember from the str() function that the Police.uk data includes the longitude and latitude. We can plot what this looks like in R. You may notice there are some outliers!
+
+```{r}
+plot(violent_offences$Longitude, violent_offences$Latitude)
+
+```
+
+###Spatial data
+
+We'll also take the opportunity to read in the the our hex spatial data. We use the rgdal package and the readOGR() function. This can read in shape files into R. We'll also look at what the data contains.
+
+```{r, warning=FALSE, message=FALSE}
+
+hex<- readOGR(dsn = ".", layer = "Hex_peds", verbose = FALSE)
+
+head(hex@data)
+
+```
+
+We note that the data contains an estimated number of daily kilometers walked by pedestrians by hexagon. This is based on information London residents have provided to the London Transport Demand Survery (trisRes). There is also an uplifted version of the data in the field titled trips which includes non-residents. I am not going to go into the details of how this is calculated but it is based on where non-residents have collisions. Note for the purposes of today we are going to ingore the **Count** field as this referred to something else.
+
+Now we have read in the spatial data we are going to firstly convert our violent offences into spatial data and then ensure that both of the data sets use the same projection. To do this we first have to remove NA values from our violence data as R will not know how to process these. Once we have matched the projections we can overlay them together in a simple plot.
+
+```{r}
+
+#remove NA values
+violent_offences <- violent_offences[!is.na(violent_offences$Latitude),]
+
+# create spatial points data frame
+coord<-SpatialPoints(violent_offences[,c("Longitude","Latitude")], )
+
+violent_offences<-SpatialPointsDataFrame(coord,violent_offences)
+
+# assign projection
+proj4string(violent_offences)<- CRS("+init=epsg:4326")
+
+# transform for hex to match
+hex<-spTransform(hex,CRS("+init=epsg:4326"))
+
+#now we can plot the data together
+plot(hex)
+plot(violent_offences, add = T)
+
+
+```
+
+### Spatially aggregating the data
+
+Now we have the our data spatially ready to go  we can start aggregating it by hexagon. We will use the sp package and the over() function to count the number of crimes per hexagon. This function generates a list that we can then use an lapply() to give us a total number of crimes per hexagon polygon.
+
+```{r}
+
+# we have to reference the polygons 
+crime_in_polygons<- over(SpatialPolygons(hex@polygons), SpatialPoints(violent_offences), returnList = T)
+
+hex$total = unlist(lapply(crime_in_polygons, length))
+
+```
+
+As we are planning to build a linear regression model we probably want more than one predictor to make it more interesting. For the demonstration today we are also going to read in data on the locations of bus stops and again agregate those.
+
+```{r, warning=FALSE, message= FALSE}
+bus_stops <- readOGR(".", layer = "Bus_Stops_with_routes_v2", verbose = F)
+
+# lets remove the withdrawn bus stops, we will take a naive approach and remove them all for now
+bus_stops<- bus_stops[!is.na(bus_stops$WITHDRAWN_),]
+
+# and make sure the projection match
+bus_stops <- spTransform(bus_stops,CRS("+init=epsg:4326"))
+
+# now aggregate as before
+bus_in_polygons<- over(SpatialPolygons(hex@polygons), SpatialPoints(bus_stops), returnList = T)
+
+hex$bus_stops = unlist(lapply(bus_in_polygons, length))
+
+```
+
+Let's take a look at our hex data now.
+
+```{r}
+head(hex@data)
+
+```
+
+### Linear regression for spatial data
+
+OK we now have some spatial data which contains the number of average daily pedestrian trips in kilometres, the number of bus stops and the number of violent offences per hexagon. Say we wanted to test two hypothesis: 
+
+- That the volume of crime is dependent on the number of people in a location.
+- That the volume of crime is dependent of the number of bus stops in a location.
+
+We can try and use a linear regression model to do this. In linear regression we state that our outcome / response or dependent variable is a function of our independent or predictor variables. This is usually written as:
+
+$y = \alpha + \beta X + u$
+
+Here our dependent variable is the number of crimes, and our predictor variables are the number of pedestraian trips (as a proxy for ambient population) and the number of bus stops. 
+
+We can plug in our variables into the formula in R using the lm() function, short for linear model.
+
+```{r}
+#let's build a standard linear regression model
+
+model1<- lm(total ~ bus_stops + trips, data = hex@data)
+
+summary (model1)
+
+```
+
+The results of our model seem to show that both the number of trips and the number of bus stops are significant and positively correlated to the number of violent offences that take place.
+
+Is our model robust though? An ordinary least squares regression (OLS - as above) makes some assumptions about our data, including that the residuals should not be autcorrelated and heteroskedatic. The error term should also be normally distrbuted. We can look at these assumptions by using the plot() function to plot our model:
+
+```{r}
+#plot the data
+par(mfrow = c(2,2))
+
+#we note our residuals are corrleated - violates one of linear regression assumptions
+plot(model1)
+
+```
+
+Oh dear we have some issues in the correlation of our residuals and the normality of them.
+
+Why is this? This is most likley due to the data displaying spatial dependence. That is to say the data is obeying Tobler's law and observations near eachother are similar which is causing instability in our linear model. We can test for autocorrelation in the data using the excellent spdep package and Morans I statistic. The Morans I is a test for spatial auto-correlation and compares the local averages against a global one and then produces the I statistic which tells you whether data is attracting or repelling eachother (postively or negatively correlated). You can find more information on it [here](http://www.statisticshowto.com/morans-i/).
+
+<br>
+
+###Spatial dependence
+
+To calculate the Morans I in R we first have to create a spatial weights matrix. There are two steps to do this in R, we first tell R how our spatial polygons are related to eachtoher and then the type of weights we would like to use. We use queens contiguity so all surrounding hexagons are factored in and set a zero policy so cells without neighbours can be included. The style "W" refers to a row standardised weighting, so neighbours are weighted according to how many there are. So if a hexagon has six neighbours each will be given a weighting of 1/6.
+
+```{r}
+
+# We will use queens contiguity so all surrounding hexagons are included
+hex_nbq<-poly2nb(hex, queen = T)
+
+# Next we create our spaital weights, zero policy allows us to have 0 values in neighbourhood cells
+datw<- nb2listw(hex_nbq, style = "W", zero.policy = T)
+
+```
+
+Now we have our weights we can calculate the Morans I statistic.
+
+```{r}
+
+moran.test(hex@data$total, datw,
+           randomisation=TRUE,
+           alternative="two.sided",
+           zero.policy=T
+)
+
+```
+
+We note that the I statistics is both positive and highly significant indicating strong auto-correlation in our data. We can also use the moran.plot function to check.
+
+```{r}
+#first we reset our plotting window
+
+par(mfrow=c(1,1))
+
+#now plot
+moran.plot(hex$total, listw = datw)
+
+
+```
+
+Again we can see our data is clustering in high value cells. We can also test for auto-correlation in our residuals from linear model. The plots from earlier indicated this might be the case. We use the lm.morantest().
+
+```{r}
+lm.morantest(model1, listw = datw)
+```
+
+We note that the residuals are positively correlated and that the assumptions of the OLS are therefore violated. This could be affecting the output of of our model. Luckily there are ways to account for this using techniques for spatial regression.
+
+<br>
+
+### Spatial regression
+
+There are two common types of spatial regression used, the Spatial lag (Spatial Autogressive) model and the Spatial error model. There is a third type also occassionally used, the Spaital Durbin model, but we will not focus on this here. 
+
+The Spatial lag model is modelled similarly to the the autoreggessive component of a time series:
+
+$y = \rho W y + X\beta + e$
+
+Where we weight the neighbouring y values of the cells accordingly. This means we take into account the affect they are having.
+
+Alternative we can use the spatial error model:
+
+$y = X\beta + e$
+
+$e = \lambda Wu+ u$
+
+Which one do we use as we know we have correlation in both components? Well fortunately the spdep package also has a function for this, the lm.LMtests() which will compares both models and indicate which is more appropriate for our data. 
+
+```{r}
+LM<- lm.LMtests(model= model1, listw = datw, zero.policy = T, test = "all")
+
+print(LM)
+
+```
+
+The initial tests inidcates that both the error model and lag model are appropriate, therefore we use the more robust versions. The robust tests indicate that while both are appropriate the lag model is more so.
+
+We use the spdep package's lagsarlm() function to compute a spatial lag model. This function defaults to the lag model although there are other options available. Use ?lagsarlm to find out more.
+
+There are a couple of steps we need to do to make this model is computationally efficient to run. We construct a sparse matrix to reference which cells are important to look at and we also re-scale our trips variable to make it more efficient. Without these steps, R will take a long time process the data.
+
+We finally print our model and ask that the Nagelkerke psuedo $R^2$ is included to estimate how much of the variation in the model is explained.
+
+```{r}
+# We construct a sparse matrix first
+W = as(datw, "CsparseMatrix")
+trMat = trW(W, type="MC")
+
+#we're also going to re-scale our pedestrian trips variable for easier computation
+hex$trips_thous<- hex$trips/10000
+
+
+# the lag model can be referenced via
+model2<- lagsarlm(total ~ bus_stops + trips_thous, data = hex@data,
+                  listw = datw, zero.policy = T,
+                  trs = trMat, method = "Matrix")
+
+# we note that the spatial dependences is positive and significant
+summary(model2, Nagelkerke = T)
+
+```
+
+We note that both pedestrian trips and bus stops are important and still positively correlated. You may notice that the thrips effect size is much higher but that's because we rescaled the data! None-the-less controliing for spatial dependence and bus stops we see an increase of 19 violent offences per 10,000 pedestrian kilometres.
+
+There are some interesting findings here. Firstly are spatial auto-correlation component, rho, is significant when included in the model meaning we should account for its presence.
+
+Our [AIC](https://en.wikipedia.org/wiki/Akaike_information_criterion) is also lower indicating our model is more appropriate for the data than the OLS version. 
+
+The log likelihood also indicates that our model is better than deault model.
+
+We have now have regression model that can help us understand what's going in for violent offences in London. Obviously there are some key things missing here we might want to include, such as the number of pubs and bars in future models. We may also want to test for interaction between our variables and whether the indepdent variables are covarying which would be problematic. But that's for another time.
+
+<br>
+
+That's all for today. I highly recommend the following and more in-depth tutorial here:
+
+[http://www.econ.uiuc.edu/~lab/workshop/Spatial_in_R.html](http://www.econ.uiuc.edu/~lab/workshop/Spatial_in_R.html )
+
+There is also vignette for the spdep package here:
+
+[spdep Vignete](https://cran.r-project.org/web/packages/spdep/vignettes/nb_igraph.html)
+
+<br>
+
+**END**
